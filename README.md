@@ -29,8 +29,8 @@ Pass `-Port` to override the engine default for any engine (e.g. Redis on 6379).
 # De-duplicated unique-client registry for MSSQL (1433), polling every 60s
 .\Track-DbClients.ps1
 
-# Unique-client registry for PostgreSQL (5432) with reverse-resolved hostnames
-.\Track-DbClients.ps1 -Engine postgres -ResolveHosts
+# Unique-client registry for PostgreSQL (5432), hostnames resolved by default
+.\Track-DbClients.ps1 -Engine postgres
 
 # One raw snapshot of the current connections and exit
 .\Track-DbClients.ps1 -TimeSeries -NoLoop
@@ -51,7 +51,9 @@ Pass `-Port` to override the engine default for any engine (e.g. Redis on 6379).
 | `-IntervalSeconds`  | `60`                             | Seconds between polls when looping (range 1–86400). |
 | `-CsvPath`          | `.\ <engine>-clients-<port>-<yyyyMM>.csv` | Output CSV path. Leaving it unset enables monthly rotation (one file per calendar month); an explicit path disables rotation. |
 | `-TimeSeries`       | off                              | Emit a raw per-poll time-series log (client IPs repeat) instead of the de-duplicated registry. |
-| `-ResolveHosts`     | off                              | Reverse-resolve each IP to a hostname (slower, cached per IP). |
+| `-ResolveHosts`     | on (default)                     | Kept for backwards compatibility; reverse DNS is now always on unless `-NoResolveHosts` is given. |
+| `-NoResolveHosts`   | off                              | Skip reverse-DNS lookups; `HostName` stays empty. |
+| `-RolloverMB`       | `5`                              | Max size in MB of a monthly log part before rolling to a new numbered part mid-month. Ignored with an explicit `-CsvPath`. |
 | `-NoLoop`           | off                              | Take a single snapshot and exit (good for Task Scheduler). |
 
 ## Modes
@@ -76,11 +78,19 @@ Timestamp,ClientIP,HostName,ConnectionCount
 
 ## Log rotation
 
-The default output rotates **monthly**: one CSV per calendar month, named `<engine>-clients-<port>-<yyyyMM>.csv` (e.g. `mssql-clients-1433-202609.csv`). A forever-running loop switches to the new file automatically when the month turns over — no restart needed.
+The default output is one CSV per calendar month: `<engine>-clients-<port>-<yyyyMM>.csv` (e.g. `mssql-clients-1433-202609.csv`).
 
-- **Registry mode**: each monthly file is a self-contained registry for that month; on rollover the new month starts fresh (existing clients re-seen get a new `FirstSeen` in the new file).
-- **TimeSeries mode**: plain append-per-month, as expected.
+- **Month change** always starts a fresh file — a forever-running loop switches automatically at the first poll of the new month, no restart needed.
+- **Size rollover**: if the current file grows past `-RolloverMB` (default **5 MB**), it rolls over mid-month to a numbered part — `mssql-clients-1433-202609-02.csv`, `-03`, and so on. On startup the script picks up the newest part that is still under the limit, so restarts keep appending to the right file.
+- **Registry mode**: entries are merged across parts, so an existing part's history is never lost when a new run or rollover happens.
+- **TimeSeries mode**: plain append-per-file, as expected.
 - If you pass an explicit `-CsvPath`, rotation is disabled and everything goes to that single file.
+
+## Hostname resolution
+
+Each client IP is **reverse-resolved via DNS by default** and the result is stored in the `HostName` column (lookups are cached per IP for the life of the process). The registry de-dupes on the **IP + HostName combination**, so one IP that resolves differently over time (or fails to resolve at some point) shows up as separate rows — that is intentional, it reflects what DNS said when the client was seen.
+
+Use `-NoResolveHosts` to skip DNS entirely (faster polls, `HostName` stays empty). `-ResolveHosts` still works but is now the default and a no-op.
 
 ## Running unattended
 

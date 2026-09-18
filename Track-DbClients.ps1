@@ -29,10 +29,17 @@
                        raw time-series log (who was connected, when, how many conns).
                        Client IPs REPEAT across polls in this mode.
 
-    The default output log rotates MONTHLY: one file per calendar month, named
-    <engine>-clients-<port>-<yyyyMM>.csv. A long-running loop switches files
-    automatically when the month turns over. Passing -CsvPath explicitly writes
-    to that one file with no rotation.
+    Log rotation: the default output is one file per calendar month, named
+    <engine>-clients-<port>-<yyyyMM>.csv. If the file grows past -RolloverMB
+    (default 5) mid-month, it rolls over to a numbered part
+    (<engine>-clients-<port>-<yyyyMM>-02.csv, -03, ...). A long-running loop
+    checks on every poll and switches files automatically. Passing -CsvPath
+    explicitly writes to that one file with no rotation.
+
+    Client hostnames are reverse-resolved via DNS by default (cached per IP);
+    the registry de-dupes on the IP + HostName combination, so one IP that
+    resolves differently over time (or fails to resolve at some point) is
+    tracked as separate entries. Use -NoResolveHosts to skip DNS lookups.
 
     IMPORTANT LIMITATIONS:
       * Only connections alive at the moment of a poll are seen. Very short-lived
@@ -62,7 +69,16 @@
     de-duplicated unique-client registry.
 
 .PARAMETER ResolveHosts
-    Reverse-resolve each IP to a hostname (slower, cached per IP).
+    Reverse-resolve each IP to a hostname (this is now the DEFAULT; the switch
+    is kept for backwards compatibility and is a no-op).
+
+.PARAMETER NoResolveHosts
+    Skip reverse-DNS lookups; HostName stays empty.
+
+.PARAMETER RolloverMB
+    Max size in MB of a monthly log part before rolling to a new numbered
+    part mid-month. Default 5. Only applies to the auto-generated monthly
+    path (ignored when -CsvPath is given explicitly).
 
 .PARAMETER NoLoop
     Take a single snapshot and exit (good for Task Scheduler).
@@ -72,8 +88,8 @@
     Build a de-duplicated unique-client registry for MSSQL (1433), polling every 60s.
 
 .EXAMPLE
-    .\Track-DbClients.ps1 -Engine postgres -ResolveHosts
-    Unique-client registry for PostgreSQL (5432) with reverse-resolved hostnames.
+    .\Track-DbClients.ps1 -Engine postgres -NoResolveHosts
+    Unique-client registry for PostgreSQL (5432) without DNS lookups.
 
 .EXAMPLE
     .\Track-DbClients.ps1 -TimeSeries -NoLoop
@@ -105,6 +121,11 @@ param(
 
     [switch]$ResolveHosts,
 
+    [switch]$NoResolveHosts,
+
+    [ValidateRange(1, 1024)]
+    [int]$RolloverMB = 5,
+
     [switch]$NoLoop
 )
 
@@ -129,14 +150,43 @@ if ($Port -gt 0) {
     throw "Engine '$Engine' has no default port. Pass -Port explicitly."
 }
 
+# --- Log part helpers (monthly rotation + size rollover) -----------------
+# NOTE: these must be defined BEFORE the "Resolve output path" block below,
+# which calls them at load time.
+function Get-PartPath {
+    param([string]$Dir, [string]$Engine, [int]$Port, [string]$Stamp, [int]$Part)
+    $suffix = if ($Part -gt 1) { "-{0:d2}" -f $Part } else { '' }
+    Join-Path $Dir "$Engine-clients-$Port-$Stamp$suffix.csv"
+}
+
+# Highest existing part for a month that is still under the size limit;
+# if even the newest part is oversized, returns the next part number.
+function Get-CurrentCsvPart {
+    param([string]$Dir, [string]$Engine, [int]$Port, [string]$Stamp)
+    $maxBytes = $RolloverMB * 1MB
+    $parts = @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match ("^{0}-clients-{1}-{2}(-\d\d)?\.csv$" -f [regex]::Escape($Engine), $Port, $Stamp) } |
+        ForEach-Object {
+            $p = 1
+            if ($_.Name -match '-(\d\d)\.csv$') { $p = [int]$Matches[1] }
+            [pscustomobject]@{ Part = $p; Size = $_.Length }
+        } | Sort-Object Part)
+    if ($parts.Count -eq 0) { return 1 }
+    $newest = $parts[-1]
+    if ($newest.Size -ge $maxBytes) { return $newest.Part + 1 }
+    return $newest.Part
+}
+
 # --- Resolve output path -------------------------------------------------
-# Default log rotates monthly: one file per calendar month.
-$CsvDir   = $null
-$CsvStamp = $null
+# Default log rotates monthly; mid-month only when a part exceeds -RolloverMB.
+$CsvDir   = $null   # set only for the auto-generated (rotating) path
+$CsvStamp = $null   # current yyyyMM stamp
+$CsvPart  = 1       # current part within the month (1 = no suffix)
 if ([string]::IsNullOrWhiteSpace($CsvPath)) {
     $CsvDir   = (Get-Location).Path
     $CsvStamp = Get-Date -Format 'yyyyMM'
-    $CsvPath  = Join-Path $CsvDir "$Engine-clients-$Port-$CsvStamp.csv"
+    $CsvPart  = Get-CurrentCsvPart -Dir $CsvDir -Engine $Engine -Port $Port -Stamp $CsvStamp
+    $CsvPath  = Get-PartPath $CsvDir $Engine $Port $CsvStamp $CsvPart
 }
 $CsvPath = (New-Object System.IO.FileInfo $CsvPath).FullName
 
@@ -150,9 +200,13 @@ if (-not (Test-Path -LiteralPath $CsvPath)) {
 }
 
 # --- Helpers -------------------------------------------------------------
+# Reverse DNS is ON by default; -NoResolveHosts turns it off. (-ResolveHosts
+# is kept as a no-op for backwards compatibility.)
+$DoResolve = -not $NoResolveHosts
+
 $dnsCache = @{}
 function Get-HostNameFor([string]$ip) {
-    if (-not $ResolveHosts) { return '' }
+    if (-not $DoResolve) { return '' }
     if ($dnsCache.ContainsKey($ip)) { return $dnsCache[$ip] }
     $name = ''
     try { $name = [System.Net.Dns]::GetHostEntry($ip).HostName } catch { $name = '' }
@@ -185,12 +239,17 @@ function Append-TimeSeriesRow {
 }
 
 # --- Registry load (de-dupe persistence across runs) ---------------------
+# Registry entries are unique per IP + HostName combination.
+function Get-RegistryKey([string]$ip, [string]$hostName) { "$ip|$hostName" }
+
 function Read-RegistryCsv {
     param([string]$Path)
     $loaded = @{}
     Import-Csv -LiteralPath $Path -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.ClientIP) {
-            $loaded[$_.ClientIP] = [pscustomobject]@{
+            $key = Get-RegistryKey $_.ClientIP $_.HostName
+            $loaded[$key] = [pscustomobject]@{
+                ClientIP            = $_.ClientIP
                 HostName            = $_.HostName
                 FirstSeen           = $_.FirstSeen
                 LastSeen            = $_.LastSeen
@@ -210,10 +269,9 @@ if (-not $TimeSeries) {
 function Write-Registry {
     $sb = New-Object System.Text.StringBuilder
     $null = $sb.AppendLine($Header)
-    foreach ($ip in ($registry.Keys | Sort-Object)) {
-        $r = $registry[$ip]
+    foreach ($r in ($registry.Values | Sort-Object ClientIP, HostName)) {
         $fields = @(
-            (ConvertTo-CsvField $ip),
+            (ConvertTo-CsvField $r.ClientIP),
             (ConvertTo-CsvField $r.HostName),
             (ConvertTo-CsvField $r.FirstSeen),
             (ConvertTo-CsvField $r.LastSeen),
@@ -247,18 +305,36 @@ try {
         $now     = Get-Date
         $iso     = $now.ToString('o')
 
-        # Monthly rollover: if the month changed since we opened the log
-        # (only when using the auto-generated monthly path), switch files.
+        # Log rollover (only for the auto-generated monthly path):
+        #   * month changed         -> start that month's part 01
+        #   * current part too big  -> next numbered part within the month
         if ($CsvDir) {
-            $month = $now.ToString('yyyyMM')
+            $month    = $now.ToString('yyyyMM')
+            $maxBytes = $RolloverMB * 1MB
+            $rollTo   = $null
             if ($month -ne $CsvStamp) {
                 $CsvStamp = $month
-                $CsvPath  = Join-Path $CsvDir "$Engine-clients-$Port-$month.csv"
-                Write-Host "New month -> logging to $CsvPath"
+                $CsvPart  = Get-CurrentCsvPart -Dir $CsvDir -Engine $Engine -Port $Port -Stamp $month
+                $rollTo   = "New month"
+            }
+            elseif ((Get-Item -LiteralPath $CsvPath -ErrorAction SilentlyContinue).Length -ge $maxBytes) {
+                $CsvPart += 1
+                $rollTo   = "Log exceeded ${RolloverMB}MB"
+            }
+            if ($rollTo) {
+                $CsvPath = Get-PartPath $CsvDir $Engine $Port $CsvStamp $CsvPart
+                Write-Host "$rollTo -> logging to $CsvPath"
                 if (-not (Test-Path -LiteralPath $CsvPath)) {
                     [System.IO.File]::WriteAllText($CsvPath, $Header + "`r`n")
                 }
-                if (-not $TimeSeries) { $registry = Read-RegistryCsv -Path $CsvPath }
+                # registry: carry over in-memory entries; merge anything already
+                # written to the new part by an earlier run
+                if (-not $TimeSeries) {
+                    $existing = Read-RegistryCsv -Path $CsvPath
+                    foreach ($k in $existing.Keys) {
+                        if (-not $registry.ContainsKey($k)) { $registry[$k] = $existing[$k] }
+                    }
+                }
             }
         }
 
@@ -274,25 +350,27 @@ try {
         }
         else {
             foreach ($c in $clients) {
-                if (-not $registry.ContainsKey($c.ClientIP)) {
-                    $registry[$c.ClientIP] = [pscustomobject]@{
-                        HostName            = (Get-HostNameFor $c.ClientIP)
+                $hostName = Get-HostNameFor $c.ClientIP
+                $key      = Get-RegistryKey $c.ClientIP $hostName
+                if (-not $registry.ContainsKey($key)) {
+                    $registry[$key] = [pscustomobject]@{
+                        ClientIP            = $c.ClientIP
+                        HostName            = $hostName
                         FirstSeen           = $iso
                         LastSeen            = $iso
                         SeenPolls           = 1
                         LastConnectionCount = $c.ConnectionCount
                     }
-                    Write-Host "  NEW client: $($c.ClientIP)"
+                    Write-Host "  NEW client: $($c.ClientIP)$(@{ $true = " ($hostName)"; $false = '' }[$hostName -ne ''])"
                 } else {
-                    $r = $registry[$c.ClientIP]
+                    $r = $registry[$key]
                     $r.LastSeen            = $iso
                     $r.SeenPolls           = $r.SeenPolls + 1
                     $r.LastConnectionCount = $c.ConnectionCount
-                    if ([string]::IsNullOrWhiteSpace($r.HostName)) { $r.HostName = (Get-HostNameFor $c.ClientIP) }
                 }
             }
             Write-Registry
-            Write-Host ("[{0}] {1} unique client IP(s) tracked" -f $now.ToString('s'), $registry.Count)
+            Write-Host ("[{0}] {1} unique client IP/hostname(s) tracked" -f $now.ToString('s'), $registry.Count)
         }
 
         if ($NoLoop) { break }
@@ -302,6 +380,7 @@ try {
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 250
             # month may turn while we sleep; top of loop handles the switch
+            # (a size rollover just waits for the next poll - fine)
             if ($CsvDir -and (Get-Date).ToString('yyyyMM') -ne $CsvStamp) { break }
             if ($interactive) {
                 try {
