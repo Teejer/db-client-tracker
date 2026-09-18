@@ -92,6 +92,22 @@ Each client IP is **reverse-resolved via DNS by default** and the result is stor
 
 Use `-NoResolveHosts` to skip DNS entirely (faster polls, `HostName` stays empty). `-ResolveHosts` still works but is now the default and a no-op.
 
+## Task Scheduler
+
+`Track-DbClients.Task.xml` is an importable Task Scheduler definition:
+
+- Runs forever as **SYSTEM** (reads the TCP table fine, no password to maintain); add `-ResolveHosts`-style flags to `<Arguments>` if you want them.
+- Starts once at its boundary time, restarts automatically after reboots/failures (`StartWhenAvailable` + restart-on-failure every 5 min), no execution time limit, hidden window.
+- Paths assume the script lives in `C:\Scripts\trackDbClients\` — edit `<Arguments>`/`<WorkingDirectory>` if yours differs.
+
+To import: Task Scheduler → *Action* → *Import Task…* → pick the XML, or:
+
+```cmd
+schtasks /Create /TN "\Database\Track-DbClients" /XML "Track-DbClients.Task.xml" /F
+```
+
+If you prefer a bounded run instead of a forever loop, change `-File ... -Engine mssql` to add `-NoLoop` and schedule a `PT1M`/`PT5M` repetition trigger.
+
 ## Running unattended
 
 For scheduled/unattended use, prefer `-NoLoop` with Task Scheduler (e.g. run every 5 minutes) over a forever-running loop:
