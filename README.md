@@ -49,7 +49,7 @@ Pass `-Port` to override the engine default for any engine (e.g. Redis on 6379).
 | `-Engine`           | `mssql`                          | Which database to label and which default port to use. One of `mssql`, `mariadb`, `postgres`, `custom`. |
 | `-Port`             | engine default                   | Local TCP port to watch. Overrides the engine default. Required for `-Engine custom`. |
 | `-IntervalSeconds`  | `60`                             | Seconds between polls when looping (range 1–86400). |
-| `-CsvPath`          | `.\ <engine>-clients-<port>-<yyyyMMdd>.csv` | Output CSV path. |
+| `-CsvPath`          | `.\ <engine>-clients-<port>-<yyyyMM>.csv` | Output CSV path. Leaving it unset enables monthly rotation (one file per calendar month); an explicit path disables rotation. |
 | `-TimeSeries`       | off                              | Emit a raw per-poll time-series log (client IPs repeat) instead of the de-duplicated registry. |
 | `-ResolveHosts`     | off                              | Reverse-resolve each IP to a hostname (slower, cached per IP). |
 | `-NoLoop`           | off                              | Take a single snapshot and exit (good for Task Scheduler). |
@@ -73,6 +73,14 @@ Appends a row per distinct client IP each poll, producing a raw time-series log 
 Timestamp,ClientIP,HostName,ConnectionCount
 2026-09-18T09:00:00.0000000+02:00,10.0.0.21,app01.corp.local,3
 ```
+
+## Log rotation
+
+The default output rotates **monthly**: one CSV per calendar month, named `<engine>-clients-<port>-<yyyyMM>.csv` (e.g. `mssql-clients-1433-202609.csv`). A forever-running loop switches to the new file automatically when the month turns over — no restart needed.
+
+- **Registry mode**: each monthly file is a self-contained registry for that month; on rollover the new month starts fresh (existing clients re-seen get a new `FirstSeen` in the new file).
+- **TimeSeries mode**: plain append-per-month, as expected.
+- If you pass an explicit `-CsvPath`, rotation is disabled and everything goes to that single file.
 
 ## Running unattended
 

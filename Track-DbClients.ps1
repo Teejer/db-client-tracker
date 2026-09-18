@@ -29,6 +29,11 @@
                        raw time-series log (who was connected, when, how many conns).
                        Client IPs REPEAT across polls in this mode.
 
+    The default output log rotates MONTHLY: one file per calendar month, named
+    <engine>-clients-<port>-<yyyyMM>.csv. A long-running loop switches files
+    automatically when the month turns over. Passing -CsvPath explicitly writes
+    to that one file with no rotation.
+
     IMPORTANT LIMITATIONS:
       * Only connections alive at the moment of a poll are seen. Very short-lived
         connections between polls can be missed - lower -IntervalSeconds to reduce gaps.
@@ -47,7 +52,10 @@
     Seconds between polls when looping. Default 60.
 
 .PARAMETER CsvPath
-    Output CSV path. Default: .\<engine>-clients-<port>-<yyyyMMdd>.csv
+    Output CSV path. Default: auto-rotated monthly as
+    .\<engine>-clients-<port>-<yyyyMM>.csv (one file per calendar month).
+    If you pass an explicit path, rotation is disabled and everything goes
+    to that single file.
 
 .PARAMETER TimeSeries
     Emit a raw per-poll time-series log (client IPs repeat) instead of the default
@@ -122,9 +130,13 @@ if ($Port -gt 0) {
 }
 
 # --- Resolve output path -------------------------------------------------
+# Default log rotates monthly: one file per calendar month.
+$CsvDir   = $null
+$CsvStamp = $null
 if ([string]::IsNullOrWhiteSpace($CsvPath)) {
-    $stamp   = Get-Date -Format 'yyyyMMdd'
-    $CsvPath = Join-Path (Get-Location).Path "$Engine-clients-$Port-$stamp.csv"
+    $CsvDir   = (Get-Location).Path
+    $CsvStamp = Get-Date -Format 'yyyyMM'
+    $CsvPath  = Join-Path $CsvDir "$Engine-clients-$Port-$CsvStamp.csv"
 }
 $CsvPath = (New-Object System.IO.FileInfo $CsvPath).FullName
 
@@ -173,11 +185,12 @@ function Append-TimeSeriesRow {
 }
 
 # --- Registry load (de-dupe persistence across runs) ---------------------
-$registry = @{}
-if (-not $TimeSeries) {
-    Import-Csv -LiteralPath $CsvPath -ErrorAction SilentlyContinue | ForEach-Object {
+function Read-RegistryCsv {
+    param([string]$Path)
+    $loaded = @{}
+    Import-Csv -LiteralPath $Path -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.ClientIP) {
-            $registry[$_.ClientIP] = [pscustomobject]@{
+            $loaded[$_.ClientIP] = [pscustomobject]@{
                 HostName            = $_.HostName
                 FirstSeen           = $_.FirstSeen
                 LastSeen            = $_.LastSeen
@@ -186,6 +199,12 @@ if (-not $TimeSeries) {
             }
         }
     }
+    return $loaded
+}
+
+$registry = @{}
+if (-not $TimeSeries) {
+    $registry = Read-RegistryCsv -Path $CsvPath
 }
 
 function Write-Registry {
@@ -227,6 +246,22 @@ try {
     do {
         $now     = Get-Date
         $iso     = $now.ToString('o')
+
+        # Monthly rollover: if the month changed since we opened the log
+        # (only when using the auto-generated monthly path), switch files.
+        if ($CsvDir) {
+            $month = $now.ToString('yyyyMM')
+            if ($month -ne $CsvStamp) {
+                $CsvStamp = $month
+                $CsvPath  = Join-Path $CsvDir "$Engine-clients-$Port-$month.csv"
+                Write-Host "New month -> logging to $CsvPath"
+                if (-not (Test-Path -LiteralPath $CsvPath)) {
+                    [System.IO.File]::WriteAllText($CsvPath, $Header + "`r`n")
+                }
+                if (-not $TimeSeries) { $registry = Read-RegistryCsv -Path $CsvPath }
+            }
+        }
+
         $clients = @(Get-CurrentClients)
 
         if ($TimeSeries) {
@@ -266,6 +301,8 @@ try {
         $deadline = (Get-Date).AddSeconds($IntervalSeconds)
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 250
+            # month may turn while we sleep; top of loop handles the switch
+            if ($CsvDir -and (Get-Date).ToString('yyyyMM') -ne $CsvStamp) { break }
             if ($interactive) {
                 try {
                     if ([Console]::KeyAvailable) {
