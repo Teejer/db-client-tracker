@@ -108,6 +108,8 @@ schtasks /Create /TN "\Database\Track-DbClients" /XML "Track-DbClients.Task.xml"
 
 If you prefer a bounded run instead of a forever loop, change `-File ... -Engine mssql` to add `-NoLoop` and schedule a `PT1M`/`PT5M` repetition trigger.
 
+`Track-DbClients.Task.1433-1434.xml` is the same task but with **two actions** — one forever-loop watcher per port (1433 and 1434). Each action is its own `powershell.exe` process with its own monthly CSV (`mssql-clients-1433-<yyyyMM>.csv`, `mssql-clients-1434-<yyyyMM>.csv`). Note: in the Task Scheduler UI, stopping the task kills all its actions; and if you use *Disable* on the task, both watchers stop.
+
 ## Running unattended
 
 For scheduled/unattended use, prefer `-NoLoop` with Task Scheduler (e.g. run every 5 minutes) over a forever-running loop:
